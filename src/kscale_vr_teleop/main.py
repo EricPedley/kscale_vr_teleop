@@ -1,7 +1,8 @@
 import cv2
 from vuer import Vuer, VuerSession
 import asyncio
-from vuer.schemas import ImageBackground, Hands
+from vuer.events import Set
+from vuer.schemas import ImageBackground, Hands, TriMesh, DefaultScene, SceneBackground
 import numpy as np
 from kscale_vr_teleop.hand_inverse_kinematics import calculate_hand_joints_no_ik
 from kscale_vr_teleop.udp_conn import RLUDPHandler
@@ -16,8 +17,13 @@ from kscale_vr_teleop.command_conn import Commander16
 from pathlib import Path
 from line_profiler import profile
 import warnings
+import trimesh
 
 urdf_path  = str(ASSETS_DIR / "kbot_legless_7dof" / "robot.urdf")
+left_gripper_mesh = str(ASSETS_DIR / "kbot_legless_7dof/meshes/pitch_yoke_drive_2.stl")
+right_gripper_mesh = str(ASSETS_DIR / "kbot_legless_7dof/meshes/pitch_yoke_drive.stl")
+left_gripper = trimesh.load_mesh(left_gripper_mesh)
+right_gripper = trimesh.load_mesh(right_gripper_mesh)
 
 SEND_EE_CONTROL = False
 VISUALIZE = bool(os.environ.get("VISUALIZE", False))
@@ -54,6 +60,7 @@ dist_coeffs = np.array([[-6.07417419e-02,9.95447444e-02,-2.26448001e-04,1.228818
 head_matrix = np.eye(4, dtype=np.float32)
 right_finger_poses = np.zeros((24, 4, 4), dtype=np.float32)
 left_finger_poses = np.zeros((24, 4, 4), dtype=np.float32)
+right_wrist_pose_orig = np.eye(4, dtype=np.float32)
 right_wrist_pose = np.eye(4,dtype=np.float32)
 left_wrist_pose = np.eye(4,dtype=np.float32)
 left_wrist_pose[:3,3] = np.array([0.2, 0.2, -0.4])
@@ -120,6 +127,8 @@ async def control_arms(session: VuerSession):
             handler.send_commands(right_arm_joints, left_arm_joints)
 
         if VISUALIZE:
+            right_arm_joints = np.zeros(7)
+            left_arm_joints = np.zeros(7)
             new_config = {k.name: right_arm_joints[i] for i, k in enumerate(ik_solver.active_joints[::2])}
             new_config.update({k.name: left_arm_joints[i] for i, k in enumerate(ik_solver.active_joints[1::2])})
             urdf_logger.log(new_config)
@@ -130,6 +139,24 @@ async def control_arms(session: VuerSession):
             fps = 1/(current_time - loop_start)
             print(f"\rFPS: {fps:.2f} | Frames: {frame_count}", end="", flush=True)
             last_fps_print = current_time
+        
+        left_wrist_pose_corrected = left_wrist_pose.copy()
+        right_wrist_pose_corrected = right_wrist_pose.copy()
+
+        left_wrist_pose_corrected[:3, :3] += head_matrix[:3, :3]
+        left_wrist_pose_corrected = fast_mat_inv(kbot_vuer_to_urdf_frame) @ left_wrist_pose_corrected
+        left_wrist_pose_corrected = left_wrist_pose_corrected.T.flatten().tolist()
+        
+        session.update @ TriMesh(
+                key="left_gripper", 
+                vertices=np.array(left_gripper.vertices), 
+                faces=np.array(left_gripper.faces), 
+                matrix=right_wrist_pose_orig.flatten().tolist(),
+                color="#000000",
+                materialType="depth",
+            )
+            # TriMesh(key="right_gripper", vertices=np.array(right_gripper.vertices), faces=np.array(right_gripper.faces), transform=(fast_mat_inv(kbot_vuer_to_urdf_frame) @ right_wrist_pose).T),
+        
 
         await asyncio.sleep(1/30)  # ~30 FPS for smoother streaming
 
@@ -214,11 +241,12 @@ if __name__ == "__main__":
 
     @app.add_handler("HAND_MOVE")
     async def hand_move_handler(event, session):
-        global left_wrist_pose, right_wrist_pose, left_finger_poses, right_finger_poses
+        global left_wrist_pose, right_wrist_pose, left_finger_poses, right_finger_poses, right_wrist_pose_orig
         if event.key == 'hands':
             if 'leftState' in event.value and event.value['leftState']:
                 left_mat_raw = event.value['left']
                 left_mat_numpy = np.array(left_mat_raw, dtype=np.float32).reshape(25, 4, 4).transpose((0,2,1))
+                right_wrist_pose_orig = np.array(left_mat_raw, dtype=np.float32).reshape(25, 4, 4)
                 left_wrist_pose[:] = kbot_vuer_to_urdf_frame @ left_mat_numpy[0]
                 left_wrist_pose[:3, 3] -= head_matrix[:3, 3]
                 left_finger_poses[:] = (hand_vuer_to_urdf_frame @ fast_mat_inv(left_mat_numpy[0]) @ left_mat_numpy[1:].T).T
@@ -234,21 +262,35 @@ if __name__ == "__main__":
     try:
         @app.spawn(start=True)
         async def main(session: VuerSession):
-                session.upsert(
-                    Hands(
-                        stream=True,
-                        key="hands",
-                        hideLeft=False,       # hides the hand, but still streams the data.
-                        hideRight=False,      # hides the hand, but still streams the data.
+            session @ Set(
+                DefaultScene(
+                    SceneBackground(),
+                    TriMesh(
+                        key="left_gripper",
+                        vertices=np.array(left_gripper.vertices),
+                        faces=np.array(left_gripper.faces),
+                        matrix=np.eye(4).flatten().tolist(),
+                        color="#000000",
+                        materialType="depth",
                     ),
-                    to="bgChildren",
                 )
-                tasks = [
-                    stream_cameras(session),
-                    control_arms(session)
-                ]
+            )
 
-                await asyncio.gather(*tasks)
+            session.upsert(
+                Hands(
+                    stream=True,
+                    key="hands",
+                    hideLeft=False,       # hides the hand, but still streams the data.
+                    hideRight=False,      # hides the hand, but still streams the data.
+                ),
+                to="bgChildren",
+            )
+            tasks = [
+                stream_cameras(session),
+                control_arms(session)
+            ]
+
+            await asyncio.gather(*tasks)
     finally:
         print("Saving logs to", logs_path)
         rr.save(logs_path)

@@ -7,7 +7,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "env": {
-                "STREAM": "1"
+                "VISUALIZE": "1"
             }
         }
     ]
